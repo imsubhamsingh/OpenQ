@@ -1,14 +1,31 @@
 import time
+import datetime
 import threading
 from collections import deque
 from uuid import uuid4
 
 
 class Message:
+    """
+    Represents a message object that can be processed by a consumer.
+
+    Attributes:
+        id (str): A unique identifier for the message.
+        body (str): The content of the message.
+        received_at (datetime or None): Timestamp when the message was received; None initially and set when consumed.
+    """
+
     def __init__(self, body):
         self.id = str(uuid4())
         self.body = body
         self.received_at = None
+
+    def mark_received(self):
+        """
+        Marks the message as received by setting the current timestamp
+        to the `received_at` attribute.
+        """
+        self.received_at = datetime.datetime.now()
 
 
 class VisibilityTimeOutExpired(Exception):
@@ -26,6 +43,13 @@ class MessageNotFoundError(Exception):
 class OpenQ:
     """
     A Simple Python in-memory message Queue Service
+
+    Attributes:
+        name (str): Name of the queue.
+        messages (deque<Message>): A thread-safe double-ended queue that stores messages.
+        visibility_timeout (int): The amount of time a message stays hidden after being dequeued before it becomes visible again (in seconds).
+        dlq (OpenQ): Dead-letter queue where messages are moved after visibility timeout expires.
+        lock (threading.Lock): A Lock object used to ensure thread-safe access to the queue.
     """
 
     def __init__(self, name, visibility_timeout=300, dlq=None):
@@ -53,7 +77,7 @@ class OpenQ:
             if not self.messages:
                 return None
             message = self.messages.pop()
-            message.received_at = int(time.time())
+            message.mark_received()
             t = threading.Timer(self.visibility_timeout, self._requeue, [message])
             t.start()
             return message
@@ -68,7 +92,7 @@ class OpenQ:
                     if message.id == message_id:
                         if self._visibility_timeout_expired(message):
                             raise VisibilityTimeOutExpired(
-                                "Visibility timeout expired; message requeued."
+                                "Visibility timeout expired; message re-queued."
                             )
                         self.messages.remove(message)  # Remove message from queue
                         print(f"Acknowledged Task ID: {message.id}")
@@ -91,11 +115,15 @@ class OpenQ:
 
     def _visibility_timeout_expired(self, message):
         """
-        Helper method to check visibility timeout
+        Check if the visibility timeout has expired for the given message.
+
+        Returns:
+            True if the visibility timeout expired, False otherwise.
         """
-        now = int(time.time())
-        expiry_time = message.received_at + self.visibility_timeout
-        return now >= expiry_time
+        expiry_time = message.received_at + datetime.timedelta(
+            seconds=self.visibility_timeout
+        )
+        return datetime.datetime.now() >= expiry_time
 
 
 class Producer(threading.Thread):
