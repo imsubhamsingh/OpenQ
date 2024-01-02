@@ -1,7 +1,10 @@
+import os
+import json
 import time
 import datetime
 import threading
 from collections import deque
+from json.decoder import JSONDecodeError
 from uuid import uuid4
 
 
@@ -58,6 +61,8 @@ class OpenQ:
         self.visibility_timeout = visibility_timeout
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
+        self.storage_file = f"{self.name}_storage.json"
+        self._load_from_dick()
 
     def enqueue(self, message_body):
         """
@@ -66,6 +71,8 @@ class OpenQ:
         with self.lock:
             message = Message(message_body)
             self.messages.appendleft(message)
+            # After enqueueing, save the state to disk
+            self._save_to_disk()
             return message.id
 
     def dequeue(self):
@@ -95,6 +102,7 @@ class OpenQ:
                                 "Visibility timeout expired; message re-queued."
                             )
                         self.messages.remove(message)  # Remove message from queue
+                        self._save_to_disk()  # Save state after deleting
                         print(f"Acknowledged Task ID: {message.id}")
                         return
         raise VisibilityTimeOutExpired("Message ID not found or already acknowledged.")
@@ -124,6 +132,62 @@ class OpenQ:
             seconds=self.visibility_timeout
         )
         return datetime.datetime.now() >= expiry_time
+
+    def _save_to_disk(self):
+        """
+        Save the current message queue to a JSON file for persistence.
+        """
+        with open(self.storage_file, "w") as f:
+            serializable_messages = [
+                {
+                    "id": msg.id,
+                    "body": msg.body,
+                    "received_at": msg.received_at.isoformat()
+                    if msg.received_at
+                    else None,
+                }
+                for msg in self.messages
+            ]
+            json.dump(serializable_messages, f)
+
+    def _load_from_disk(self):
+        """
+        Load messages from a JSON file into the message queue during initialization.
+        """
+        if os.path.exists(self.storage_file):
+            try:
+                with open(self.storage_file, "r") as f:
+                    loaded_messages = json.load(f)
+            except JSONDecodeError:
+                # If JSON contents are invalid, initialize with an empty list
+                loaded_messages = []
+            for msg_data in loaded_messages:
+                msg = Message(msg_data["body"])
+                msg.id = msg_data["id"]
+                msg.received_at = (
+                    datetime.datetime.fromisoformat(msg_data["received_at"])
+                    if msg_data["received_at"]
+                    else None
+                )
+                self.messages.append(msg)
+
+    def _purge(self):
+        """
+        Purge all messages from the queue and cancel all running timers along with storage file
+        """
+        with self.lock:
+            self.messages.clear()
+
+            current_timers = list(threading.enumerate())
+            for timer in current_timers:
+                if isinstance(timer, threading.Timer):
+                    timer.cancel()
+
+            # Delete the storage file if exists
+            if os.path.exists(self.storage_file):
+                os.remove(self.storage_file)
+
+            print(f"The queue '{self.name}' and storage has been purged")
 
 
 class Producer(threading.Thread):
@@ -190,8 +254,8 @@ class Consumer(threading.Thread):
 ## Queue Creation Junction ##
 
 # Create main queue and dead-letter queue
-dlq = OpenQ(name="dead-letter-queue", visibility_timeout=10)
-main_queue = OpenQ(name="main-queue", visibility_timeout=10, dlq=dlq)
+dlq = OpenQ(name="dead-letter-queue", visibility_timeout=100)
+main_queue = OpenQ(name="main-queue", visibility_timeout=100, dlq=dlq)
 
 # Set number of tasks to be produced
 num_tasks = 5
