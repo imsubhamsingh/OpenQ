@@ -38,8 +38,6 @@ class VisibilityTimeOutExpired(Exception):
 
 
 class MessageNotFoundError(Exception):
-    """Raised when the message ID is not found."""
-
     pass
 
 
@@ -61,6 +59,8 @@ class OpenQ:
         self.visibility_timeout = visibility_timeout
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
+        # Add a dictionary to track timers for easy cancellation
+        self.message_timers = {}
         self.storage_file = f"{self.name}_storage.json"
         self._load_from_disk()
 
@@ -69,6 +69,7 @@ class OpenQ:
         Simulate enqueuing messages into the queue
         """
         with self.lock:
+            # Create a unique message ID and timestamp
             message = Message(message_body)
             self.messages.appendleft(message)
             # After enqueueing, save the state to disk
@@ -85,8 +86,12 @@ class OpenQ:
                 return None
             message = self.messages.pop()
             message.mark_received()
-            t = threading.Timer(self.visibility_timeout, self._requeue, [message])
+            t = threading.Timer(
+                self.visibility_timeout, self._requeue_or_move_to_dlq, [message]
+            )
             t.start()
+            # Track the timer by message ID
+            self.message_timers[message.id] = t
             return message
 
     def delete(self, message_id):
@@ -94,32 +99,40 @@ class OpenQ:
         Simulate consumers sending back acknowledgment of message processing
         """
         with self.lock:
-            if any(m.id == message_id for m in self.messages):
-                for message in self.messages:
-                    if message.id == message_id:
-                        if self._visibility_timeout_expired(message):
-                            raise VisibilityTimeOutExpired(
-                                "Visibility timeout expired; message re-queued."
-                            )
-                        self.messages.remove(message)  # Remove message from queue
-                        self._save_to_disk()  # Save state after deleting
-                        print(f"Acknowledged Task ID: {message.id}")
-                        return
-        raise VisibilityTimeOutExpired("Message ID not found or already acknowledged.")
+            # Attempt to cancel the visibility timer first
+            timer = self.message_timers.pop(message_id, None)
+            if timer:
+                timer.cancel()
 
-    def _requeue(self, message):
+            # Check if the message is still in the list of messages
+            for message in self.messages:
+                if message.id == message_id:
+                    self.messages.remove(message)  # Remove message from queue
+                    self._save_to_disk()  # Save state after deleting
+                    print(f"Acknowledged Task ID: {message.id}")
+                    return
+            # Since the message was neither in the timer nor in the messages,
+            # it might have been already deleted or moved to DLQ.
+            # We should not raise an exception here as it could be a normal case.
+            # Consider logging this occurrence for debugging purposes if necessary.
+            # raise  MessageNotFoundError("Message ID not found or already acknowledged.")
+
+    def _requeue_or_move_to_dlq(self, message):
         """
         Helper method to renqueue messages of they timeout
         """
         with self.lock:
-            if self._visibility_timeout_expired(message):
+            timer = self.message_timers.pop(message.id, None)
+            # If timer is None, it means that the delete operation was successful
+            if timer is not None:
+                message.received_at = None
                 if self.dlq:
                     print(f"Task ID: {message.id} moved to DLQ")
                     # Move to DLQ
                     self.dlq.enqueue(message.body)
                 else:
                     # Requeue in the current queue
-                    self.messages.appendleft(message)
+                    self.messages.append(message)
 
     def _visibility_timeout_expired(self, message):
         """
@@ -158,30 +171,47 @@ class OpenQ:
             try:
                 with open(self.storage_file, "r") as f:
                     loaded_messages = json.load(f)
-            except JSONDecodeError:
+
+            except (FileNotFoundError, JSONDecodeError) as e:
+                # Catch any exception during file read and JSON decoding
                 # If JSON contents are invalid, initialize with an empty list
+                print(
+                    f"Failed to load storage file ({e}); initializing an empty queue."
+                )
                 loaded_messages = []
+
             for msg_data in loaded_messages:
+                try:
+                    received_at = (
+                        datetime.datetime.fromisoformat(msg_data["received_at"])
+                        if msg_data["received_at"]
+                        else None
+                    )
+                except ValueError:
+                    received_at = None
+
                 msg = Message(msg_data["body"])
                 msg.id = msg_data["id"]
-                msg.received_at = (
-                    datetime.datetime.fromisoformat(msg_data["received_at"])
-                    if msg_data["received_at"]
-                    else None
-                )
+                msg.received_at = received_at
                 self.messages.append(msg)
 
-    def _purge(self):
+    def _cancel_timer(self, message_id):
+        timer = self.message_timers.get(message_id)
+        # Only attempt to cancel the timer if it exists
+        if timer:
+            timer.cancel()
+            del self.message_timers[message_id]
+
+    def purge(self):
         """
         Purge all messages from the queue and cancel all running timers along with storage file
         """
         with self.lock:
             self.messages.clear()
-
-            current_timers = list(threading.enumerate())
-            for timer in current_timers:
-                if isinstance(timer, threading.Timer):
-                    timer.cancel()
+            # Cancel all timers related to this queue's messages
+            for timer in self.message_timers.values():
+                timer.cancel()
+            self.message_timers.clear()
 
             # Delete the storage file if exists
             if os.path.exists(self.storage_file):
@@ -264,12 +294,15 @@ num_tasks = 5
 producer_thread = Producer(main_queue, num_tasks)
 consumer_thread = Consumer(main_queue)
 
-producer_thread.start()
-consumer_thread.start()
+try:
+    producer_thread.start()
+    consumer_thread.start()
 
-
-# The join() method is a synchronization mechanism that ensures that the main program waits
-# for the threads to complete before moving on. Calling join() on producer_thread causes the
-# main thread of execution to block until producer_thread finishes its task.
-producer_thread.join()
-consumer_thread.join()
+except KeyboardInterrupt:
+    print("Terminating the Producer and Consumer threads...")
+    # The join() method is a synchronization mechanism that ensures that the main program waits
+    # for the threads to complete before moving on. Calling join() on producer_thread causes the
+    # main thread of execution to block until producer_thread finishes its task.
+    consumer_thread.queue.purge()
+    producer_thread.join()
+    consumer_thread.join()
