@@ -62,7 +62,7 @@ class OpenQ:
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
         self.storage_file = f"{self.name}_storage.json"
-        self._load_from_dick()
+        self._load_from_disk()
 
     def enqueue(self, message_body):
         """
