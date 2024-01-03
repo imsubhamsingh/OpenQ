@@ -70,10 +70,8 @@ class OpenQ:
         self.visibility_timeout = visibility_timeout
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
-        # Add a dictionary to track timers for easy cancellation
         self.message_timers = {}
-        self.storage_file = f"{self.name}_storage.json"
-        self._load_from_disk()
+        # self.storage_file = f"{self.name}_storage.json"
 
     def enqueue(self, message_body):
         """
@@ -84,7 +82,7 @@ class OpenQ:
         # print(f"ENQ message {message.id}, {message.timestamp}")
         with self.lock:  # Ensure thread-safe access to add messages.
             self.messages.appendleft(message)
-            self._save_to_disk()  # Consider saving less frequently depending on your use case.
+            # self._save_to_disk()  # Consider saving less frequently depending on your use case.
         return message.id
 
     def dequeue(self):
@@ -123,7 +121,7 @@ class OpenQ:
                     self.consumed_messages.appendleft(message)  # Add to consumed queue
                     self.messages.remove(message)
                     print(f"Acknowledged Task ID: {message.id}")
-                    self._save_to_disk()  # Save state after deleting
+                    # self._save_to_disk()  # Save state after deleting
                     return
 
             # Since the message was neither in the timer nor in the messages,
@@ -266,29 +264,41 @@ class Producer(threading.Thread):
             num_tasks (int): The total number of tasks to be produced.
             sleep_time (float): Time in seconds to wait between task productions.
         """
-        super().__init__()
+        super().__init__(
+            daemon=True
+        )  # Make thread a daemon so it won't prevent program termination
         self.queue = queue
-        self.num_tasks = num_tasks
-        if sleep_time < 0:
-            raise ValueError("sleep_time must be non-negative")
-        self.sleep_time = sleep_time
+        self.num_tasks = max(0, num_tasks)
+        self.sleep_time = max(0, sleep_time)
 
     def run(self):
         """
         Overwrites the Thread.run() method. Produces num_tasks tasks, each followed by a sleep period.
         """
         for i in range(self.num_tasks):
-            message_body = f"Task {i}"
-            try:
-                message_id = self.queue.enqueue(message_body)
+            message_body = f"Hello Task {i}"
+            message_id = self._produce_message(message_body)
+            if message_id:
                 logging.info(
-                    f"📩 Produced to Queue: {self.queue.name} Task ID: {message_id}"
+                    f"📩 Produced to Queue: '{self.queue.name}' - Task ID: {message_id}"
                 )
-            except Exception as e:
-                logging.info(f"An error occurred while enqueueing: {e}")
+            else:
+                logging.info(f"Failed to produce Task {i} to Queue '{self.queue.name}'")
+
             # Sleep only if there are more tasks to produce to avoid unnecessary delay after the last task.
-            if i < self.num_tasks - 1:
-                time.sleep(self.sleep_time)
+            should_sleep = i < self.num_tasks - 1
+            self._sleep_if_necessary(should_sleep)
+
+    def _produce_message(self, message_body):
+        try:
+            return self.queue.enqueue(message_body)
+        except Exception as e:
+            logging.exception(f" An error occurred while enqueueing: {e}")
+            return None
+
+    def _sleep_if_necessary(self, should_sleep):
+        if should_sleep:
+            time.sleep(self.sleep_time)
 
 
 class Consumer(threading.Thread):
@@ -314,41 +324,60 @@ class Consumer(threading.Thread):
         """
         super().__init__()
         self.queue = queue
+        self.processing_time = max(0.0, processing_time)
+        self.empty_queue_sleep = max(0.0, empty_queue_sleep)
         self._running = True
-        self.processing_time = processing_time
-        self.empty_queue_sleep = empty_queue_sleep
 
     def stop(self):
         """
-        Method to signal the consumer to stop consuming messages.
+        Signals the consumer to gracefully shutdown.
         """
         self._running = False
 
     def run(self):
         """
-        Continuously consumes messages from the queue until stopped.
-        Processes each message and deletes it from the queue after processing.
+        The main execution method of the thread that continues to consume and process tasks.
         """
         while self._running:
+            message = None
             try:
                 message = self.queue.dequeue()
                 if message:
-                    logging.info(
-                        f"📨 Consumed Task ID: {message.id}, Body: {message.body}"
-                    )
-                    try:
-                        # Simulate processing time
-                        time.sleep(self.processing_time)
-                        self.queue.delete(message.id)
-                    except VisibilityTimeOutExpired as e:
-                        print(str(e))
+                    self._process_message(message)
                 else:
-                    logging.info(
-                        f"😴 Queue {self.queue.name} is empty, waiting for tasks..."
-                    )
-                    time.sleep(self.empty_queue_sleep)
-            except Exception as e:
-                logging.exception(f"An error occurred while dequeuing: {e}")
+                    self._wait_for_tasks()
+            except Exception as error:
+                logging.exception(f"An error occurred during message handling: {error}")
+                if message:
+                    self._handle_failed_dequeue(message)
+
+    def _process_message(self, message):
+        """
+        Process a message and deletes it from the queue afterwards.
+        """
+        logging.info(f"Consumed Task ID: {message.id}, {message.body}")
+        try:
+            time.sleep(self.processing_time)
+            self.queue.delete(message.id)
+        except Exception as e:
+            logging.exception(f"Failed to delete task after processing: {str(e)}")
+
+    def _wait_for_tasks(self):
+        """
+        If the queue is empty, logs the condition and sleeps for specified duration.
+        """
+        logging.info(
+            f"Queue '{self.queue.name}' is empty. Consumer is waiting for tasks."
+        )
+        time.sleep(self.empty_queue_sleep)
+
+    def _handle_failed_dequeue(self, message):
+        """
+        Handles the case where a message was dequeued but not processed successfully.
+        """
+        logging.warning(
+            f"Encountered an issue with Task ID: {message.id}. It will be reprocessed."
+        )
 
 
 ## Queue Creation Junction ##
@@ -369,10 +398,10 @@ try:
     consumer_thread.start()
 
 except KeyboardInterrupt:
-    print("Terminating the Producer and Consumer threads...")
+    logging.info("Terminating the threads...")
     # The join() method is a synchronization mechanism that ensures that the main program waits
     # for the threads to complete before moving on. Calling join() on producer_thread causes the
     # main thread of execution to block until producer_thread finishes its task.
-    consumer_thread.queue.purge()
-    producer_thread.join()
+    consumer_thread.stop()
     consumer_thread.join()
+    producer_thread.join()
