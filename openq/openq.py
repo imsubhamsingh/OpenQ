@@ -52,7 +52,7 @@ class MessageNotFoundError(Exception):
 
 class OpenQ:
     """
-    A Simple Python in-memory message Queue Service
+    A Simple Python in-memory FIFO message Queue Service
 
     Attributes:
         name (str): Name of the queue.
@@ -75,26 +75,23 @@ class OpenQ:
 
     def enqueue(self, message_body):
         """
-        Simulate enqueuing messages into the queue
+        Simulate enqueuing messages into the queue adhering to FIFO order.
         """
         message = Message(message_body)
-        # print(f"ENQQQQQQ self: {self.__dict__}")
-        # print(f"ENQ message {message.id}, {message.timestamp}")
-        with self.lock:  # Ensure thread-safe access to add messages.
-            self.messages.appendleft(message)
-            # self._save_to_disk()  # Consider saving less frequently depending on your use case.
+        with self.lock:
+            self.messages.append(message)
+            # self._save_to_disk()
         return message.id
 
     def dequeue(self):
         """
-        Simulate dequeuing messages from the queue, making them invisible for a defined timeout
-        Also starts a timer on each message that will call _requeue after the visibility timeout expires.
+        Simulate dequeuing messages from the queue adhering to FIFO order,
+        making them invisible for a defined timeout period.
         """
         with self.lock:
-            # print(f"DEQQQQQ self: {self.__dict__}")
             if not self.messages:
                 return None
-            message = self.messages.pop()
+            message = self.messages.popleft()
             message.mark_received()
             t = threading.Timer(
                 self.visibility_timeout, self._requeue_or_move_to_dlq, [message]
@@ -144,8 +141,13 @@ class OpenQ:
                     # Move to DLQ
                     self.dlq.enqueue(message.body)
                 else:
-                    # Requeue in the current queue
-                    self.messages.append(message)
+                    # TODO: Here correctness depends on the intended behavior.
+                    # RN our intention is for timed-out messages to retain their original position
+                    # in the queue upon requeuing (strict FIFO), so reinserting at the front.
+                    # Will see later if we have to penalize messages that time-out by placing them
+                    # at the end of the queue (effectively deprioritizing them) in that case we will
+                    # use .append() method
+                    self.messages.appendleft(message)
 
     def _visibility_timeout_expired(self, message):
         """
@@ -355,7 +357,9 @@ class Consumer(threading.Thread):
         """
         Process a message and deletes it from the queue afterwards.
         """
-        logging.info(f"Consumed Task ID: {message.id}, {message.body}")
+        logging.info(
+            f"Consumed Task ID: {message.id}, {message.body}, {message.timestamp}"
+        )
         try:
             time.sleep(self.processing_time)
             self.queue.delete(message.id)
