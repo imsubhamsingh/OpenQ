@@ -1,11 +1,19 @@
 import os
 import json
 import time
+import logging
 import datetime
 import threading
 from collections import deque
 from json.decoder import JSONDecodeError
 from uuid import uuid4
+
+# Configure the logging system
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 
 class Message:
@@ -22,6 +30,7 @@ class Message:
         self.id = str(uuid4())
         self.body = body
         self.received_at = None
+        self.timestamp = datetime.datetime.now()
 
     def mark_received(self):
         """
@@ -56,6 +65,8 @@ class OpenQ:
     def __init__(self, name, visibility_timeout=300, dlq=None):
         self.name = name
         self.messages = deque()
+        # Store consumed messages
+        self.consumed_messages = deque()
         self.visibility_timeout = visibility_timeout
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
@@ -68,13 +79,13 @@ class OpenQ:
         """
         Simulate enqueuing messages into the queue
         """
-        with self.lock:
-            # Create a unique message ID and timestamp
-            message = Message(message_body)
+        message = Message(message_body)
+        # print(f"ENQQQQQQ self: {self.__dict__}")
+        # print(f"ENQ message {message.id}, {message.timestamp}")
+        with self.lock:  # Ensure thread-safe access to add messages.
             self.messages.appendleft(message)
-            # After enqueueing, save the state to disk
-            self._save_to_disk()
-            return message.id
+            self._save_to_disk()  # Consider saving less frequently depending on your use case.
+        return message.id
 
     def dequeue(self):
         """
@@ -82,6 +93,7 @@ class OpenQ:
         Also starts a timer on each message that will call _requeue after the visibility timeout expires.
         """
         with self.lock:
+            # print(f"DEQQQQQ self: {self.__dict__}")
             if not self.messages:
                 return None
             message = self.messages.pop()
@@ -107,10 +119,13 @@ class OpenQ:
             # Check if the message is still in the list of messages
             for message in self.messages:
                 if message.id == message_id:
-                    self.messages.remove(message)  # Remove message from queue
-                    self._save_to_disk()  # Save state after deleting
+                    # self.messages.remove(message)  # Remove message from queue
+                    self.consumed_messages.appendleft(message)  # Add to consumed queue
+                    self.messages.remove(message)
                     print(f"Acknowledged Task ID: {message.id}")
+                    self._save_to_disk()  # Save state after deleting
                     return
+
             # Since the message was neither in the timer nor in the messages,
             # it might have been already deleted or moved to DLQ.
             # We should not raise an exception here as it could be a normal case.
@@ -148,20 +163,30 @@ class OpenQ:
 
     def _save_to_disk(self):
         """
-        Save the current message queue to a JSON file for persistence.
+        Save the current state to JSON files for persistence.
         """
-        with open(self.storage_file, "w") as f:
-            serializable_messages = [
-                {
-                    "id": msg.id,
-                    "body": msg.body,
-                    "received_at": msg.received_at.isoformat()
-                    if msg.received_at
-                    else None,
-                }
-                for msg in self.messages
-            ]
-            json.dump(serializable_messages, f)
+        try:
+            with open(f"{self.name}_pending_storage.json", "w") as f:
+                json.dump(self._serialize_messages(self.messages), f)
+
+            with open(f"{self.name}_consumed_storage.json", "w") as f:
+                json.dump(self._serialize_messages(self.consumed_messages), f)
+
+        except IOError as e:
+            print(f"Error saving consumed tasks: {e}")
+
+    def _serialize_messages(self, message_queue):
+        """
+        Helper method to serialize messages for saving to disk
+        """
+        return [
+            {
+                "id": msg.id,
+                "body": msg.body,
+                "received_at": msg.received_at.isoformat() if msg.received_at else None,
+            }
+            for msg in message_queue
+        ]
 
     def _load_from_disk(self):
         """
@@ -222,63 +247,108 @@ class OpenQ:
 
 class Producer(threading.Thread):
     """
-    The Producer class is a subclass of Thread that simulates the production
-    of tasks. It puts task messages onto a provided queue and prints out a log
-    message for each task produced with its corresponding queue name and task ID.
+    The Producer class is responsible for producing tasks and adding them
+    to the provided queue. Each task produced is logged with the queue name
+    and a unique task ID.
+
     Attributes:
-        queue (Queue): an instance of a queue class which has an enqueue method
-                    to add message to the queue.
-        num_tasks (int): the number of tasks to produce and put in the queue.
+        queue (Queue): An instance of a queue class which supports an enqueue method.
+        num_tasks (int): Number of tasks to produce.
+        sleep_time (float): Seconds to sleep after producing each task.
     """
 
-    def __init__(self, queue, num_tasks):
+    def __init__(self, queue, num_tasks, sleep_time=1.0):
+        """
+        Initialize the Producer instance with a queue, number of tasks, and sleep interval.
+
+        Args:
+            queue (Queue): The queue instance where tasks will be added.
+            num_tasks (int): The total number of tasks to be produced.
+            sleep_time (float): Time in seconds to wait between task productions.
+        """
         super().__init__()
         self.queue = queue
         self.num_tasks = num_tasks
+        if sleep_time < 0:
+            raise ValueError("sleep_time must be non-negative")
+        self.sleep_time = sleep_time
 
     def run(self):
         """
-        Producing messages to queue
+        Overwrites the Thread.run() method. Produces num_tasks tasks, each followed by a sleep period.
         """
         for i in range(self.num_tasks):
             message_body = f"Task {i}"
-            message_id = self.queue.enqueue(message_body)
-            print(f"📩 Produced to Queue: {self.queue.name} Task ID: {message_id}")
-            time.sleep(1)
+            try:
+                message_id = self.queue.enqueue(message_body)
+                logging.info(
+                    f"📩 Produced to Queue: {self.queue.name} Task ID: {message_id}"
+                )
+            except Exception as e:
+                logging.info(f"An error occurred while enqueueing: {e}")
+            # Sleep only if there are more tasks to produce to avoid unnecessary delay after the last task.
+            if i < self.num_tasks - 1:
+                time.sleep(self.sleep_time)
 
 
 class Consumer(threading.Thread):
     """
-    The Consumer class is a subclass of Thread that simulates the consumption
-    of tasks. It retrieves task messages from the provided queue, processes them,
-    and then deletes them from the queue.
+    The Consumer class is designed to consume tasks from a queue, process,
+    and delete those tasks.
 
     Attributes:
-        queue (Queue): an instance of a queue class which has dequeue and delete
-                    methods to remove and process messages from the queue.
+        queue (Queue): An instance of a queue class which has methods dequeue and
+                       delete for message manipulation.
+        processing_time (float): Time taken to process a task.
+        empty_queue_sleep (float): Time to sleep when the queue is empty.
     """
 
-    def __init__(self, queue):
+    def __init__(self, queue, processing_time=2.0, empty_queue_sleep=1.0):
+        """
+        Constructor to initialize the Consumer thread.
+
+        Args:
+            queue (Queue): The queue from which messages will be consumed.
+            processing_time (float): Time to simulate task processing.
+            empty_queue_sleep (float): Sleep duration when the queue is found empty.
+        """
         super().__init__()
         self.queue = queue
+        self._running = True
+        self.processing_time = processing_time
+        self.empty_queue_sleep = empty_queue_sleep
+
+    def stop(self):
+        """
+        Method to signal the consumer to stop consuming messages.
+        """
+        self._running = False
 
     def run(self):
         """
-        Consumes message and listens to queue
+        Continuously consumes messages from the queue until stopped.
+        Processes each message and deletes it from the queue after processing.
         """
-        while True:
-            message = self.queue.dequeue()
-            if message:
-                print(f"📨 Consumed Task ID: {message.id}, Body: {message.body}")
-                try:
-                    # Simulate processing time
-                    time.sleep(2)
-                    self.queue.delete(message.id)
-                except VisibilityTimeOutExpired as e:
-                    print(str(e))
-            else:
-                print(f"😴 Queue {self.queue.name} is empty, waiting for tasks...")
-                time.sleep(1)
+        while self._running:
+            try:
+                message = self.queue.dequeue()
+                if message:
+                    logging.info(
+                        f"📨 Consumed Task ID: {message.id}, Body: {message.body}"
+                    )
+                    try:
+                        # Simulate processing time
+                        time.sleep(self.processing_time)
+                        self.queue.delete(message.id)
+                    except VisibilityTimeOutExpired as e:
+                        print(str(e))
+                else:
+                    logging.info(
+                        f"😴 Queue {self.queue.name} is empty, waiting for tasks..."
+                    )
+                    time.sleep(self.empty_queue_sleep)
+            except Exception as e:
+                logging.exception(f"An error occurred while dequeuing: {e}")
 
 
 ## Queue Creation Junction ##
