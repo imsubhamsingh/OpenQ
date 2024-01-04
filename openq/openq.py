@@ -71,16 +71,22 @@ class OpenQ:
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
         self.message_timers = {}
-        # self.storage_file = f"{self.name}_storage.json"
+        # Initialize storage file paths
+        self.pending_storage_file = f"{self.name}_pending_storage.json"
+        self.consumed_storage_file = f"{self.name}_consumed_storage.json"
+
+        # Load messages from disk
+        # self.messages = self._load_from_disk(self.pending_storage_file)
+        # self.consumed_messages = self._load_from_disk(self.consumed_storage_file)
 
     def enqueue(self, message_body):
         """
         Simulate enqueuing messages into the queue adhering to FIFO order.
         """
-        message = Message(message_body)
         with self.lock:
+            message = Message(message_body)
             self.messages.append(message)
-            # self._save_to_disk()
+            self._save_to_disk(self.messages, self.pending_storage_file)
         return message.id
 
     def dequeue(self):
@@ -111,21 +117,37 @@ class OpenQ:
             if timer:
                 timer.cancel()
 
-            # Check if the message is still in the list of messages
-            for message in self.messages:
+            # Look for the message within in-memory deque
+            found_message_index = None
+            for i, message in enumerate(self.messages):
+                print(f"message.id, {message.id} ===== message_id {message_id}")
                 if message.id == message_id:
-                    # self.messages.remove(message)  # Remove message from queue
-                    self.consumed_messages.appendleft(message)  # Add to consumed queue
-                    self.messages.remove(message)
-                    print(f"Acknowledged Task ID: {message.id}")
-                    # self._save_to_disk()  # Save state after deleting
-                    return
+                    found_message_index = i
+                    break
 
-            # Since the message was neither in the timer nor in the messages,
-            # it might have been already deleted or moved to DLQ.
-            # We should not raise an exception here as it could be a normal case.
-            # Consider logging this occurrence for debugging purposes if necessary.
-            # raise  MessageNotFoundError("Message ID not found or already acknowledged.")
+            if found_message_index is not None:
+                acknowledged_message = self.messages.pop(
+                    found_message_index
+                )  # Remove message directly from deque
+
+                try:
+                    # Save only the necessary changes to disk
+                    self.consumed_messages.append(acknowledged_message)
+                    self._save_to_disk(
+                        [acknowledged_message], self.consumed_storage_file
+                    )
+                except Exception as e:
+                    logging.exception(
+                        f"An error occurred while trying to delete message: {e}"
+                    )
+
+                # Exit the function after handling found message
+                logging.info(f"Acknowledged Task ID: {message_id}")
+            else:
+                # If no message was found, log a warning outside the critical section
+                logging.warning(
+                    f"Message ID not found or already acknowledged: {message_id}"
+                )
 
     def _requeue_or_move_to_dlq(self, message):
         """
@@ -161,19 +183,15 @@ class OpenQ:
         )
         return datetime.datetime.now() >= expiry_time
 
-    def _save_to_disk(self):
+    def _save_to_disk(self, message_queue, filepath):
         """
         Save the current state to JSON files for persistence.
         """
         try:
-            with open(f"{self.name}_pending_storage.json", "w") as f:
-                json.dump(self._serialize_messages(self.messages), f)
-
-            with open(f"{self.name}_consumed_storage.json", "w") as f:
-                json.dump(self._serialize_messages(self.consumed_messages), f)
-
+            with open(filepath, "w") as f:
+                json.dump(self._serialize_messages(message_queue), f)
         except IOError as e:
-            print(f"Error saving consumed tasks: {e}")
+            logging.error(f"Error saving tasks to {filepath}: {e}")
 
     def _serialize_messages(self, message_queue):
         """
@@ -188,37 +206,37 @@ class OpenQ:
             for msg in message_queue
         ]
 
-    def _load_from_disk(self):
+    def _load_from_disk(self, filepath):
         """
         Load messages from a JSON file into the message queue during initialization.
         """
-        if os.path.exists(self.storage_file):
+        if os.path.exists(filepath):
             try:
-                with open(self.storage_file, "r") as f:
+                with open(filepath, "r") as f:
                     loaded_messages = json.load(f)
 
             except (FileNotFoundError, JSONDecodeError) as e:
                 # Catch any exception during file read and JSON decoding
                 # If JSON contents are invalid, initialize with an empty list
-                print(
-                    f"Failed to load storage file ({e}); initializing an empty queue."
+                logging.error(
+                    f"Failed to load storage file {filepath} ({e}); initializing an empty queue."
                 )
-                loaded_messages = []
+                return deque()
+            return deque(
+                [self._deserialize_message(msg_data) for msg_data in loaded_messages]
+            )
+        return deque()
 
-            for msg_data in loaded_messages:
-                try:
-                    received_at = (
-                        datetime.datetime.fromisoformat(msg_data["received_at"])
-                        if msg_data["received_at"]
-                        else None
-                    )
-                except ValueError:
-                    received_at = None
-
-                msg = Message(msg_data["body"])
-                msg.id = msg_data["id"]
-                msg.received_at = received_at
-                self.messages.append(msg)
+    def _deserialize_message(self, msg_data):
+        received_at = (
+            datetime.datetime.fromisoformat(msg_data["received_at"])
+            if msg_data["received_at"]
+            else None
+        )
+        msg = Message(msg_data["body"])
+        msg.id = msg_data["id"]
+        msg.received_at = received_at
+        return msg
 
     def _cancel_timer(self, message_id):
         timer = self.message_timers.get(message_id)
@@ -267,7 +285,7 @@ class Producer(threading.Thread):
             sleep_time (float): Time in seconds to wait between task productions.
         """
         super().__init__(
-            daemon=True
+            daemon=False
         )  # Make thread a daemon so it won't prevent program termination
         self.queue = queue
         self.num_tasks = max(0, num_tasks)
@@ -315,7 +333,7 @@ class Consumer(threading.Thread):
         empty_queue_sleep (float): Time to sleep when the queue is empty.
     """
 
-    def __init__(self, queue, processing_time=2.0, empty_queue_sleep=1.0):
+    def __init__(self, queue, processing_time=5.0, empty_queue_sleep=1.0):
         """
         Constructor to initialize the Consumer thread.
 
@@ -345,6 +363,7 @@ class Consumer(threading.Thread):
             try:
                 message = self.queue.dequeue()
                 if message:
+                    print("Message:", message.id, message.body)
                     self._process_message(message)
                 else:
                     self._wait_for_tasks()
@@ -357,14 +376,15 @@ class Consumer(threading.Thread):
         """
         Process a message and deletes it from the queue afterwards.
         """
-        logging.info(
-            f"Consumed Task ID: {message.id}, {message.body}, {message.timestamp}"
-        )
         try:
+            # Message processing logic here
+            logging.info(f"Consuming Task ID: {message.id}")
+            # Simulate message processing with a sleep
             time.sleep(self.processing_time)
+            # Delete the message from the queue after processing
             self.queue.delete(message.id)
         except Exception as e:
-            logging.exception(f"Failed to delete task after processing: {str(e)}")
+            logging.exception(f"Failed to process or delete task: {str(e)}")
 
     def _wait_for_tasks(self):
         """
