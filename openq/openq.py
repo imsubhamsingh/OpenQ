@@ -14,6 +14,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+DEBUG = True
 
 
 class Message:
@@ -57,27 +58,21 @@ class OpenQ:
     Attributes:
         name (str): Name of the queue.
         messages (deque<Message>): A thread-safe double-ended queue that stores messages.
+        consumed_message (deque<Message>): A thread-safe double-ended queue that stores consumed messages.
         visibility_timeout (int): The amount of time a message stays hidden after being dequeued before it becomes visible again (in seconds).
         dlq (OpenQ): Dead-letter queue where messages are moved after visibility timeout expires.
         lock (threading.Lock): A Lock object used to ensure thread-safe access to the queue.
+        message_timers (dict): A dict contains list of message.id as key and timer object as value.
     """
 
     def __init__(self, name, visibility_timeout=300, dlq=None):
         self.name = name
-        self.messages = deque()
-        # Store consumed messages
-        self.consumed_messages = deque()
+        self.messages = deque()  # store processed messages
+        self.consumed_messages = deque()  # Store consumed messages
         self.visibility_timeout = visibility_timeout
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
         self.message_timers = {}
-        # Initialize storage file paths
-        self.pending_storage_file = f"{self.name}_pending_storage.json"
-        self.consumed_storage_file = f"{self.name}_consumed_storage.json"
-
-        # Load messages from disk
-        # self.messages = self._load_from_disk(self.pending_storage_file)
-        # self.consumed_messages = self._load_from_disk(self.consumed_storage_file)
 
     def enqueue(self, message_body):
         """
@@ -86,7 +81,6 @@ class OpenQ:
         with self.lock:
             message = Message(message_body)
             self.messages.append(message)
-            self._save_to_disk(self.messages, self.pending_storage_file)
         return message.id
 
     def dequeue(self):
@@ -99,12 +93,18 @@ class OpenQ:
                 return None
             message = self.messages.popleft()
             message.mark_received()
-            t = threading.Timer(
-                self.visibility_timeout, self._requeue_or_move_to_dlq, [message]
+
+            # Add to consumed messages upon dequeue
+            self.consumed_messages.append(message)
+
+            # Start a timer for visibility timeout
+            timer = threading.Timer(
+                self.visibility_timeout, self._handle_visibility_timeout, [message]
             )
-            t.start()
             # Track the timer by message ID
-            self.message_timers[message.id] = t
+            self.message_timers[message.id] = timer
+            timer.start()
+
             return message
 
     def delete(self, message_id):
@@ -112,42 +112,29 @@ class OpenQ:
         Simulate consumers sending back acknowledgment of message processing
         """
         with self.lock:
-            # Attempt to cancel the visibility timer first
-            timer = self.message_timers.pop(message_id, None)
-            if timer:
-                timer.cancel()
-
-            # Look for the message within in-memory deque
-            found_message_index = None
-            for i, message in enumerate(self.messages):
-                print(f"message.id, {message.id} ===== message_id {message_id}")
-                if message.id == message_id:
-                    found_message_index = i
-                    break
-
-            if found_message_index is not None:
-                acknowledged_message = self.messages.pop(
-                    found_message_index
-                )  # Remove message directly from deque
-
-                try:
-                    # Save only the necessary changes to disk
-                    self.consumed_messages.append(acknowledged_message)
-                    self._save_to_disk(
-                        [acknowledged_message], self.consumed_storage_file
+            # Remove the message from consumed_messages based on message_id
+            for msg in list(
+                self.consumed_messages
+            ):  # Iterate over a copy to avoid mutation during iteration
+                if msg.id == message_id:
+                    if DEBUG:
+                        print(f"msg.id {msg.id} ==== message_id {message_id}")
+                    logging.info(
+                        f"Deleting message with ID {message_id} from consumed messages."
                     )
-                except Exception as e:
-                    logging.exception(
-                        f"An error occurred while trying to delete message: {e}"
+                    self.consumed_messages.remove(msg)
+                    # Cancel and remove the timer associated with the message
+                    self._cancel_timer(message_id)
+                    logging.debug(
+                        f"Message with ID {message_id} has been acknowledged and deleted."
                     )
+                    return
 
-                # Exit the function after handling found message
-                logging.info(f"Acknowledged Task ID: {message_id}")
-            else:
-                # If no message was found, log a warning outside the critical section
-                logging.warning(
-                    f"Message ID not found or already acknowledged: {message_id}"
-                )
+            # If we reach this point, the message was not found in consumed_messages
+            logging.warning(
+                f"Attempted to delete non-existent or already processed message with ID {message_id}."
+            )
+            raise MessageNotFoundError(f"Message ID {message_id} not found")
 
     def _requeue_or_move_to_dlq(self, message):
         """
@@ -157,6 +144,12 @@ class OpenQ:
             timer = self.message_timers.pop(message.id, None)
             # If timer is None, it means that the delete operation was successful
             if timer is not None:
+                try:
+                    pass
+                    # self.consumed_messages.remove(message)
+                except ValueError:
+                    pass  # Message is already removed
+
                 message.received_at = None
                 if self.dlq:
                     print(f"Task ID: {message.id} moved to DLQ")
@@ -169,6 +162,16 @@ class OpenQ:
                     # Will see later if we have to penalize messages that time-out by placing them
                     # at the end of the queue (effectively deprioritizing them) in that case we will
                     # use .append() method
+                    self.messages.appendleft(message)
+
+    def _handle_visibility_timeout(self, message):
+        with self.lock:
+            if message in self.consumed_messages:
+                # self.consumed_messages.remove(message)
+                # Move message to dlq or re-queue as per your requirements
+                if self.dlq:
+                    self.dlq.enqueue(message)
+                else:
                     self.messages.appendleft(message)
 
     def _visibility_timeout_expired(self, message):
@@ -244,6 +247,9 @@ class OpenQ:
         if timer:
             timer.cancel()
             del self.message_timers[message_id]
+            logging.debug(
+                f"Visibility timer canceled for message with ID {message_id}."
+            )
 
     def purge(self):
         """
@@ -285,7 +291,7 @@ class Producer(threading.Thread):
             sleep_time (float): Time in seconds to wait between task productions.
         """
         super().__init__(
-            daemon=False
+            daemon=True
         )  # Make thread a daemon so it won't prevent program termination
         self.queue = queue
         self.num_tasks = max(0, num_tasks)
@@ -313,7 +319,7 @@ class Producer(threading.Thread):
         try:
             return self.queue.enqueue(message_body)
         except Exception as e:
-            logging.exception(f" An error occurred while enqueueing: {e}")
+            logging.exception(f"📮 An error occurred while enqueueing: {e}")
             return None
 
     def _sleep_if_necessary(self, should_sleep):
@@ -333,7 +339,7 @@ class Consumer(threading.Thread):
         empty_queue_sleep (float): Time to sleep when the queue is empty.
     """
 
-    def __init__(self, queue, processing_time=5.0, empty_queue_sleep=1.0):
+    def __init__(self, queue, processing_time=2.0, empty_queue_sleep=1.0):
         """
         Constructor to initialize the Consumer thread.
 
@@ -363,8 +369,20 @@ class Consumer(threading.Thread):
             try:
                 message = self.queue.dequeue()
                 if message:
-                    print("Message:", message.id, message.body)
                     self._process_message(message)
+                    if DEBUG:
+                        print("----" * 50)
+                        print(
+                            f"MESSAGES: {[msg.id for msg in list(self.queue.messages)]}"
+                        )
+                        print(
+                            f"CONSUMED_MESSAGES: {[msg.id for msg in list(self.queue.consumed_messages)]}"
+                        )
+                        print(f"MAIN_QUEUE_SIZE: {len(self.queue.messages)})")
+                        print(
+                            f"CONSUMED_QUEUE_SIZE: {len(self.queue.consumed_messages)}"
+                        )
+                        print("----" * 50)
                 else:
                     self._wait_for_tasks()
             except Exception as error:
@@ -378,11 +396,11 @@ class Consumer(threading.Thread):
         """
         try:
             # Message processing logic here
-            logging.info(f"Consuming Task ID: {message.id}")
+            logging.info(f"📨 Consuming Task ID: {message.id}")
             # Simulate message processing with a sleep
             time.sleep(self.processing_time)
             # Delete the message from the queue after processing
-            self.queue.delete(message.id)
+            # self.queue.delete(message.id)
         except Exception as e:
             logging.exception(f"Failed to process or delete task: {str(e)}")
 
@@ -391,7 +409,7 @@ class Consumer(threading.Thread):
         If the queue is empty, logs the condition and sleeps for specified duration.
         """
         logging.info(
-            f"Queue '{self.queue.name}' is empty. Consumer is waiting for tasks."
+            f"😴 Queue '{self.queue.name}' is empty. Consumer is waiting for tasks."
         )
         time.sleep(self.empty_queue_sleep)
 
