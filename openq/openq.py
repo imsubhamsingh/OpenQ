@@ -1,19 +1,16 @@
 import os
+import sys
 import json
 import time
+import redis
 import logging
 import datetime
 import threading
 from collections import deque
 from json.decoder import JSONDecodeError
 from uuid import uuid4
+from utils import CustomJSONEncoder, is_redis_running
 
-# Configure the logging system
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 DEBUG = True
 
 
@@ -27,11 +24,17 @@ class Message:
         received_at (datetime or None): Timestamp when the message was received; None initially and set when consumed.
     """
 
-    def __init__(self, body):
-        self.id = str(uuid4())
+    def __init__(self, id=None, body=None, received_at=None, timestamp=None):
+        if id is None:
+            self.id = str(uuid4())
+        else:
+            self.id = id
         self.body = body
-        self.received_at = None
-        self.timestamp = datetime.datetime.now()
+        self.received_at = received_at
+        if timestamp is None:
+            self.timestamp = datetime.datetime.now()
+        else:
+            self.timestamp = timestamp
 
     def mark_received(self):
         """
@@ -39,6 +42,25 @@ class Message:
         to the `received_at` attribute.
         """
         self.received_at = datetime.datetime.now()
+
+    @classmethod
+    def from_json(cls, json_str):
+        """
+        Creates a Message instance from a JSON string.
+
+        Args:
+            json_str (str): JSON string representing the message.
+
+        Returns:
+            Message: An instance of the message with the data from the JSON string.
+        """
+        data = json.loads(json_str)
+        return cls(
+            id=data.get("id"),
+            body=data.get("body"),
+            received_at=data.get("received_at"),
+            timestamp=datetime.datetime.fromisoformat(data["timestamp"]),
+        )
 
 
 class VisibilityTimeOutExpired(Exception):
@@ -73,14 +95,18 @@ class OpenQ:
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
         self.message_timers = {}
+        self.redis_client = redis.Redis(host="localhost", port=6379, db=0)
 
     def enqueue(self, message_body):
         """
         Simulate enqueuing messages into the queue adhering to FIFO order.
         """
         with self.lock:
-            message = Message(message_body)
-            self.messages.append(message)
+            message = Message(body=message_body)
+            # self.messages.append(message)
+            self.redis_client.rpush(
+                self.name, json.dumps(message.__dict__, cls=CustomJSONEncoder)
+            )
         return message.id
 
     def dequeue(self):
@@ -89,9 +115,15 @@ class OpenQ:
         making them invisible for a defined timeout period.
         """
         with self.lock:
-            if not self.messages:
+            message_data = self.redis_client.brpoplpush(
+                self.name, f"{self.name}:processing", self.visibility_timeout
+            )
+
+            if not message_data:
                 return None
-            message = self.messages.popleft()
+            message_dict = json.loads(message_data)
+            message = Message(**message_dict)
+            # message = self.messages.popleft()
             message.mark_received()
 
             # Add to consumed messages upon dequeue
@@ -107,34 +139,50 @@ class OpenQ:
 
             return message
 
-    def delete(self, message_id):
-        """
-        Simulate consumers sending back acknowledgment of message processing
-        """
-        with self.lock:
-            # Remove the message from consumed_messages based on message_id
-            for msg in list(
-                self.consumed_messages
-            ):  # Iterate over a copy to avoid mutation during iteration
-                if msg.id == message_id:
-                    if DEBUG:
-                        print(f"msg.id {msg.id} ==== message_id {message_id}")
-                    logging.info(
-                        f"Deleting message with ID {message_id} from consumed messages."
-                    )
-                    self.consumed_messages.remove(msg)
-                    # Cancel and remove the timer associated with the message
-                    self._cancel_timer(message_id)
-                    logging.debug(
-                        f"Message with ID {message_id} has been acknowledged and deleted."
-                    )
-                    return
+    # def delete(self, message_id):
+    #     """
+    #     Simulate consumers sending back acknowledgment of message processing
+    #     """
+    #     with self.lock:
+    #         # Remove the message from consumed_messages based on message_id
+    #         for msg in list(
+    #             self.consumed_messages
+    #         ):  # Iterate over a copy to avoid mutation during iteration
+    #             if msg.id == message_id:
+    #                 if DEBUG:
+    #                     print(f"msg.id {msg.id} ==== message_id {message_id}")
+    #                 logging.info(
+    #                     f"Deleting message with ID {message_id} from consumed messages."
+    #                 )
+    #                 self.consumed_messages.remove(msg)
+    #                 # Cancel and remove the timer associated with the message
+    #                 self._cancel_timer(message_id)
+    #                 logging.debug(
+    #                     f"Message with ID {message_id} has been acknowledged and deleted."
+    #                 )
+    #                 return
 
-            # If we reach this point, the message was not found in consumed_messages
-            logging.warning(
-                f"Attempted to delete non-existent or already processed message with ID {message_id}."
+    #         # If we reach this point, the message was not found in consumed_messages
+    #         logging.warning(
+    #             f"Attempted to delete non-existent or already processed message with ID {message_id}."
+    #         )
+    #         raise MessageNotFoundError(f"Message ID {message_id} not found")
+
+    def delete(self, message_id):
+        with self.lock:
+            result = self.redis_client.lrem(
+                f"{self.name}:processing",
+                1,
+                json.dumps(
+                    {
+                        "id": message_id,
+                    },
+                    cls=CustomJSONEncoder,
+                ),
             )
-            raise MessageNotFoundError(f"Message ID {message_id} not found")
+            if result == 0:
+                raise MessageNotFoundError(f"Message ID {message_id} not found")
+            self._cancel_timer(message_id)
 
     def _requeue_or_move_to_dlq(self, message):
         """
@@ -166,13 +214,17 @@ class OpenQ:
 
     def _handle_visibility_timeout(self, message):
         with self.lock:
-            if message in self.consumed_messages:
-                # self.consumed_messages.remove(message)
-                # Move message to dlq or re-queue as per your requirements
-                if self.dlq:
-                    self.dlq.enqueue(message)
-                else:
-                    self.messages.appendleft(message)
+            self.redis_client.lrem(
+                f"{self.name}:processing",
+                1,
+                json.dumps(message.__dict__, cls=CustomJSONEncoder),
+            )
+            # self.consumed_messages.remove(message)
+            # Move message to dlq or re-queue as per your requirements
+            if self.dlq:
+                self.dlq.enqueue(message.body)
+            else:
+                self.redis_client.lpush(self.name, json.dumps(message.__dict__))
 
     def _visibility_timeout_expired(self, message):
         """
@@ -267,6 +319,11 @@ class OpenQ:
                 os.remove(self.storage_file)
 
             print(f"The queue '{self.name}' and storage has been purged")
+
+    def get_messages(self, queue):
+        messages = self.redis_client.lrange(queue, 0, -1)
+        decoded_messages = [Message.from_json(m.decode("utf-8")) for m in messages]
+        return [m.__dict__ for m in decoded_messages]
 
 
 class Producer(threading.Thread):
@@ -422,28 +479,41 @@ class Consumer(threading.Thread):
         )
 
 
-## Queue Creation Junction ##
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-# Create main queue and dead-letter queue
-dlq = OpenQ(name="dead-letter-queue", visibility_timeout=100)
-main_queue = OpenQ(name="main-queue", visibility_timeout=100, dlq=dlq)
+    if not is_redis_running():
+        logging.error(
+            "🚨 Redis server is not running. Please start the Redis server and try again."
+        )
+        sys.exit(1)
 
-# Set number of tasks to be produced
-num_tasks = 5
+    ## Queue Creation Junction ##
 
-# Using threading to simulate concurrent producing and consuming processes
-producer_thread = Producer(main_queue, num_tasks)
-consumer_thread = Consumer(main_queue)
+    # Create main queue and dead-letter queue
+    dlq = OpenQ(name="dead-letter-queue", visibility_timeout=100)
+    main_queue = OpenQ(name="main-queue", visibility_timeout=100, dlq=dlq)
 
-try:
-    producer_thread.start()
-    consumer_thread.start()
+    # Set number of tasks to be produced
+    num_tasks = 5
 
-except KeyboardInterrupt:
-    logging.info("Terminating the threads...")
-    # The join() method is a synchronization mechanism that ensures that the main program waits
-    # for the threads to complete before moving on. Calling join() on producer_thread causes the
-    # main thread of execution to block until producer_thread finishes its task.
-    consumer_thread.stop()
-    consumer_thread.join()
-    producer_thread.join()
+    # Using threading to simulate concurrent producing and consuming processes
+    producer_thread = Producer(main_queue, num_tasks)
+    consumer_thread = Consumer(main_queue)
+
+    try:
+        producer_thread.start()
+        consumer_thread.start()
+
+    except KeyboardInterrupt:
+        logging.info("Terminating the threads...")
+        # The join() method is a synchronization mechanism that ensures that the main program waits
+        # for the threads to complete before moving on. Calling join() on producer_thread causes the
+        # main thread of execution to block until producer_thread finishes its task.
+        consumer_thread.stop()
+        consumer_thread.join()
+        producer_thread.join()
