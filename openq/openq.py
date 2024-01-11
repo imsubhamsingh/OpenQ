@@ -9,7 +9,7 @@ import threading
 from collections import deque
 from json.decoder import JSONDecodeError
 from uuid import uuid4
-from openq.utils import CustomJSONEncoder, is_redis_running
+from utils import CustomJSONEncoder, is_redis_running
 
 DEBUG = True
 
@@ -104,9 +104,14 @@ class OpenQ:
         with self.lock:
             message = Message(body=message_body)
             # self.messages.append(message)
-            self.redis_client.rpush(
+
+            # Start a transaction (pipeline) to ensure atomic operations
+            pipeline = self.redis_client.pipeline()
+            pipeline.rpush(
                 self.name, json.dumps(message.__dict__, cls=CustomJSONEncoder)
             )
+            pipeline.execute()  # Executes all commands in the pipeline atomically
+
         return message.id
 
     def dequeue(self):
@@ -141,17 +146,21 @@ class OpenQ:
 
     def delete(self, message_id):
         with self.lock:
-            result = self.redis_client.lrem(
-                f"{self.name}",
-                1,
-                json.dumps(
-                    {
-                        "id": message_id,
-                    },
-                    cls=CustomJSONEncoder,
-                ),
+            pipeline = self.redis_client.pipeline()
+            # Construct the message object for removal
+            fake_message = Message(id=message_id)
+            # Remove the message from the processing queue
+            pipeline.lrem(
+                f"{self.name}:processing",
+                0,
+                json.dumps(fake_message.__dict__, cls=CustomJSONEncoder),
             )
+            result = pipeline.execute()[0]
+
             if result == 0:
+                logging.warning(
+                    f"Message ID {message_id} not found or already deleted."
+                )
                 raise MessageNotFoundError(f"Message ID {message_id} not found")
             self._cancel_timer(message_id)
 
@@ -306,18 +315,26 @@ class OpenQ:
                     self.messages.appendleft(message)
 
     def _handle_visibility_timeout(self, message):
+        """
+        This method is called when the visibility timeout is reached
+        """
         with self.lock:
-            self.redis_client.lrem(
+            pipeline = self.redis_client.pipeline()
+            pipeline.lrem(
                 f"{self.name}",
                 1,
                 json.dumps(message.__dict__, cls=CustomJSONEncoder),
             )
             # self.consumed_messages.remove(message)
-            # Move message to dlq or re-queue as per your requirements
+            # Depending on your requirements, either move the message to DLQ
+            # or re-queue it by pushing to the main queue
             if self.dlq:
-                self.dlq.enqueue(message.body)
+                # self.dlq.enqueue(message.body)
+                pipeline.lpush(self.dlq.name, json.dumps(message.__dict__))
             else:
-                self.redis_client.lpush(self.name, json.dumps(message.__dict__))
+                pipeline.lpush(self.name, json.dumps(message.__dict__))
+
+            pipeline.execute()
 
     def _visibility_timeout_expired(self, message):
         """
@@ -395,23 +412,6 @@ class OpenQ:
             logging.debug(
                 f"Visibility timer canceled for message with ID {message_id}."
             )
-
-    def purge(self):
-        """
-        Purge all messages from the queue and cancel all running timers along with storage file
-        """
-        with self.lock:
-            self.messages.clear()
-            # Cancel all timers related to this queue's messages
-            for timer in self.message_timers.values():
-                timer.cancel()
-            self.message_timers.clear()
-
-            # Delete the storage file if exists
-            if os.path.exists(self.storage_file):
-                os.remove(self.storage_file)
-
-            print(f"The queue '{self.name}' and storage has been purged")
 
     def get_messages(self, queue):
         messages = self.redis_client.lrange(queue, 0, -1)
@@ -590,6 +590,10 @@ if __name__ == "__main__":
     # Create main queue and dead-letter queue
     dlq = OpenQ(name="dead-letter-queue", visibility_timeout=100)
     main_queue = OpenQ(name="main-queue", visibility_timeout=100, dlq=dlq)
+
+    # Setup signal handlers for main_queue and dlq
+    main_queue.setup_signal_handlers()
+    dlq.setup_signal_handlers()
 
     # Set number of tasks to be produced
     num_tasks = 5
