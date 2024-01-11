@@ -1,4 +1,3 @@
-import os
 import sys
 import json
 import time
@@ -54,7 +53,11 @@ class Message:
         Returns:
             Message: An instance of the message with the data from the JSON string.
         """
-        data = json.loads(json_str)
+        try:
+            data = json.loads(json_str)
+        except JSONDecodeError as e:
+            logging.exception("Failed to decode JSON: %s", json_str)
+            raise e
         return cls(
             id=data.get("id"),
             body=data.get("body"),
@@ -371,27 +374,6 @@ class OpenQ:
             for msg in message_queue
         ]
 
-    def _load_from_disk(self, filepath):
-        """
-        Load messages from a JSON file into the message queue during initialization.
-        """
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r") as f:
-                    loaded_messages = json.load(f)
-
-            except (FileNotFoundError, JSONDecodeError) as e:
-                # Catch any exception during file read and JSON decoding
-                # If JSON contents are invalid, initialize with an empty list
-                logging.error(
-                    f"Failed to load storage file {filepath} ({e}); initializing an empty queue."
-                )
-                return deque()
-            return deque(
-                [self._deserialize_message(msg_data) for msg_data in loaded_messages]
-            )
-        return deque()
-
     def _deserialize_message(self, msg_data):
         received_at = (
             datetime.datetime.fromisoformat(msg_data["received_at"])
@@ -590,10 +572,6 @@ if __name__ == "__main__":
     # Create main queue and dead-letter queue
     dlq = OpenQ(name="dead-letter-queue", visibility_timeout=100)
     main_queue = OpenQ(name="main-queue", visibility_timeout=100, dlq=dlq)
-
-    # Setup signal handlers for main_queue and dlq
-    main_queue.setup_signal_handlers()
-    dlq.setup_signal_handlers()
 
     # Set number of tasks to be produced
     num_tasks = 5
