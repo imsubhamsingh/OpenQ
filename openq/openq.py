@@ -8,7 +8,7 @@ import threading
 from collections import deque
 from json.decoder import JSONDecodeError
 from uuid import uuid4
-from utils import CustomJSONEncoder, is_redis_running
+from openq.utils import CustomJSONEncoder, is_redis_running
 
 DEBUG = True
 
@@ -166,6 +166,53 @@ class OpenQ:
                 )
                 raise MessageNotFoundError(f"Message ID {message_id} not found")
             self._cancel_timer(message_id)
+
+    @classmethod
+    def create_and_send(cls, queue_name, message_body, visibility_timeout=300):
+        """
+        Create a new queue if it doesn't exis and send a message to the queue.
+
+        Args:
+            queue_name (str): The name of the queue to create.
+            message_body (str): The body of the message to send.
+            visibility_timeout (int): Visibility timeout for the queue (default: 300 seconds).
+
+        Returns:
+            str: ID of sent message, or None if sending failed.
+        """
+        redis_client = cls._get_redis_client()
+        try:
+            if not redis_client.exists(queue_name):
+                # Create an empty list to signify the creation of the queue
+                redis_client.lpush(queue_name, "")
+
+            return cls._enqueue_to_queue(redis_client, queue_name, message_body)
+        except Exception as e:
+            raise Exception(
+                f"Failed to create queue '{queue_name}' or send message: {e}"
+            )
+
+    @staticmethod
+    def _enqueue_to_queue(redis_client, queue_name, message_body):
+        """
+        Enqueues a message into the specified Redis queue
+
+        Args:
+            redis_client (redis.Redis): The Redis client instance.
+            queue_name (str): Name of the queue.
+            message_body (str): The body of the message to send.
+
+        Returns:
+            str: ID of sent message, or None if sending failed.
+        """
+        message = Message(body=message_body)
+        try:
+            encoded_message = json.dumps(message.__dict__, cls=CustomJSONEncoder)
+            redis_client.rpush(queue_name, encoded_message)
+            return message.id
+        except Exception as e:
+            logging.exception("An error occurred while enqueueing a message: %s", e)
+            return None
 
     @classmethod
     def _get_redis_client(cls, redis_client=None):
@@ -395,9 +442,18 @@ class OpenQ:
                 f"Visibility timer canceled for message with ID {message_id}."
             )
 
-    def get_messages(self, queue):
-        messages = self.redis_client.lrange(queue, 0, -1)
-        decoded_messages = [Message.from_json(m.decode("utf-8")) for m in messages]
+    def get_messages(self):
+        # Acquire lock to ensure thread-safe access to the queue
+        with self.lock:
+            # Get all messages from the Redis queue
+            messages = self.redis_client.lrange(self.name, 0, -1)
+
+            # Decode and deserialize the messages
+            decoded_messages = []
+            for m in messages:
+                message_dict = json.loads(m.decode("utf-8"))
+                message = Message(**message_dict)
+                decoded_messages.append(message)
         return [m.__dict__ for m in decoded_messages]
 
 
