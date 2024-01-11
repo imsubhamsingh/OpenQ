@@ -9,7 +9,7 @@ import threading
 from collections import deque
 from json.decoder import JSONDecodeError
 from uuid import uuid4
-from utils import CustomJSONEncoder, is_redis_running
+from openq.utils import CustomJSONEncoder, is_redis_running
 
 DEBUG = True
 
@@ -139,39 +139,10 @@ class OpenQ:
 
             return message
 
-    # def delete(self, message_id):
-    #     """
-    #     Simulate consumers sending back acknowledgment of message processing
-    #     """
-    #     with self.lock:
-    #         # Remove the message from consumed_messages based on message_id
-    #         for msg in list(
-    #             self.consumed_messages
-    #         ):  # Iterate over a copy to avoid mutation during iteration
-    #             if msg.id == message_id:
-    #                 if DEBUG:
-    #                     print(f"msg.id {msg.id} ==== message_id {message_id}")
-    #                 logging.info(
-    #                     f"Deleting message with ID {message_id} from consumed messages."
-    #                 )
-    #                 self.consumed_messages.remove(msg)
-    #                 # Cancel and remove the timer associated with the message
-    #                 self._cancel_timer(message_id)
-    #                 logging.debug(
-    #                     f"Message with ID {message_id} has been acknowledged and deleted."
-    #                 )
-    #                 return
-
-    #         # If we reach this point, the message was not found in consumed_messages
-    #         logging.warning(
-    #             f"Attempted to delete non-existent or already processed message with ID {message_id}."
-    #         )
-    #         raise MessageNotFoundError(f"Message ID {message_id} not found")
-
     def delete(self, message_id):
         with self.lock:
             result = self.redis_client.lrem(
-                f"{self.name}:processing",
+                f"{self.name}",
                 1,
                 json.dumps(
                     {
@@ -183,6 +154,128 @@ class OpenQ:
             if result == 0:
                 raise MessageNotFoundError(f"Message ID {message_id} not found")
             self._cancel_timer(message_id)
+
+    @classmethod
+    def _get_redis_client(cls, redis_client=None):
+        """
+        Get a Redis client instance.
+
+        Args:
+            redis_client (Optional[redis.Redis]): An optional Redis client instance.
+
+        Returns:
+            redis.Redis: A Redis client instance.
+        """
+        return (
+            redis_client
+            if redis_client
+            else redis.Redis(host="localhost", port=6379, db=0)
+        )
+
+    @classmethod
+    def create_queue(cls, queue_name, visibility_timeout=300, redis_client=None):
+        """
+        Create a new queue.
+
+        Args:
+            queue_name (str): The name of the queue to create.
+            visibility_timeout (int): Visibility timeout for the queue (default: 300 seconds).
+            redis_client (Optional[redis.Redis]): An optional Redis client instance.
+
+        Raises:
+            RuntimeError: If the queue already exists.
+            Exception: If there is a problem with creating the queue.
+        """
+        try:
+            redis_client = cls._get_redis_client(redis_client)
+            if not redis_client.exists(queue_name):
+                redis_client.lpush(
+                    queue_name, ""
+                )  # Create an empty list to signify the creation of the queue
+            else:
+                raise RuntimeError(f"Queue '{queue_name}' already exists.")
+        except Exception as e:
+            raise Exception(f"Failed to create queue '{queue_name}': {e}")
+
+    @classmethod
+    def delete_queue(cls, queue_name, redis_client=None):
+        """
+        Delete an existing queue.
+
+        Args:
+            queue_name (str): The name of the queue to delete.
+            redis_client (Optional[redis.Redis]): An optional Redis client instance.
+
+        Raises:
+            RuntimeError: If the queue does not exist.
+            Exception: If there is a problem with deleting the queue.
+        """
+        try:
+            redis_client = cls._get_redis_client(redis_client)
+            if redis_client.exists(queue_name):
+                redis_client.delete(queue_name)
+            else:
+                raise RuntimeError(f"Queue '{queue_name}' does not exist.")
+        except Exception as e:
+            raise Exception(f"Failed to delete queue '{queue_name}': {e}")
+
+    @classmethod
+    def list_queues(cls, redis_client=None):
+        """
+        List all the queues in the Redis instance.
+
+        Args:
+            redis_client (Optional[redis.Redis]): An optional Redis client instance.
+
+        Returns:
+            List[str]: A list containing the names of all queues.
+        """
+        redis_client = cls._get_redis_client(redis_client)
+        # Assuming queue names do not contain colon character (':')
+        return [
+            key.decode("utf-8") for key in redis_client.keys("*") if b":" not in key
+        ]
+
+    @classmethod
+    def queue_size(cls, queue_name, redis_client=None):
+        """
+        Get the size of the queue.
+
+        Args:
+            queue_name (str): Name of the queue.
+            redis_client (Optional[redis.Redis]): An optional Redis client instance.
+
+        Returns:
+            int: Number of messages in the queue.
+        """
+        redis_client = cls._get_redis_client(redis_client)
+        return redis_client.llen(queue_name)
+
+    @classmethod
+    def delete_all_queues(cls, pattern="*", redis_client=None):
+        """
+        Delete all queues matching a pattern.
+
+        Args:
+            pattern (str): Pattern to match queue names. Defaults to '*' which matches all queues.
+            redis_client (Optional[redis.Redis]): An optional Redis client instance.
+
+        Raises:
+            Exception: If there is an error during the deletion process.
+        """
+        try:
+            redis_client = cls._get_redis_client(redis_client)
+            queues = redis_client.keys(pattern)
+
+            if not queues:
+                raise RuntimeError(f"No queues match the pattern '{pattern}'.")
+
+            for queue_name in queues:
+                redis_client.delete(queue_name)
+        except Exception as e:
+            raise Exception(
+                f"Failed to delete queues matching pattern '{pattern}': {e}"
+            )
 
     def _requeue_or_move_to_dlq(self, message):
         """
@@ -215,7 +308,7 @@ class OpenQ:
     def _handle_visibility_timeout(self, message):
         with self.lock:
             self.redis_client.lrem(
-                f"{self.name}:processing",
+                f"{self.name}",
                 1,
                 json.dumps(message.__dict__, cls=CustomJSONEncoder),
             )
