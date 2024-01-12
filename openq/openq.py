@@ -26,12 +26,9 @@ class Message:
 
     def __init__(self, id=None, body=None, received_at=None, timestamp=None):
         self.id = str(uuid4()) if id is None else id
-        self.body = body
+        self.body = str(body) if body else ""
         self.received_at = received_at
-        if timestamp is None:
-            self.timestamp = datetime.datetime.now()
-        else:
-            self.timestamp = timestamp
+        self.timestamp = timestamp if timestamp else datetime.datetime.now()
 
     def mark_received(self):
         """
@@ -62,6 +59,12 @@ class Message:
             received_at=data.get("received_at"),
             timestamp=datetime.datetime.fromisoformat(data["timestamp"]),
         )
+
+    def __str__(self):
+        return f"Message(id={self.id}, body={self.body}, timestamp={self.timestamp})"
+
+    def __repr__(self):
+        return f"<Message id={self.id}>"
 
 
 class VisibilityTimeOutExpired(Exception):
