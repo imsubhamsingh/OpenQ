@@ -6,9 +6,10 @@ import logging
 import datetime
 import threading
 from collections import deque
+from redis import Redis
 from json.decoder import JSONDecodeError
 from uuid import uuid4
-from openq.utils import CustomJSONEncoder, is_redis_running
+from utils import CustomJSONEncoder, is_redis_running
 
 DEBUG = True
 
@@ -24,10 +25,7 @@ class Message:
     """
 
     def __init__(self, id=None, body=None, received_at=None, timestamp=None):
-        if id is None:
-            self.id = str(uuid4())
-        else:
-            self.id = id
+        self.id = str(uuid4()) if id is None else id
         self.body = body
         self.received_at = received_at
         if timestamp is None:
@@ -78,11 +76,12 @@ class MessageNotFoundError(Exception):
 
 class OpenQ:
     """
-    A Simple Python in-memory FIFO message Queue Service
+    A scalable distributed messaging queue with Redis backend.
 
     Attributes:
         name (str): Name of the queue.
         messages (deque<Message>): A thread-safe double-ended queue that stores messages.
+        redis_client (Redis): Redis client for interacting with Redis server.
         consumed_message (deque<Message>): A thread-safe double-ended queue that stores consumed messages.
         visibility_timeout (int): The amount of time a message stays hidden after being dequeued before it becomes visible again (in seconds).
         dlq (OpenQ): Dead-letter queue where messages are moved after visibility timeout expires.
@@ -90,7 +89,7 @@ class OpenQ:
         message_timers (dict): A dict contains list of message.id as key and timer object as value.
     """
 
-    def __init__(self, name, visibility_timeout=300, dlq=None):
+    def __init__(self, name, redis_client=None, visibility_timeout=300, dlq=None):
         self.name = name
         self.messages = deque()  # store processed messages
         self.consumed_messages = deque()  # Store consumed messages
@@ -98,21 +97,22 @@ class OpenQ:
         self.dlq = dlq  # Dead-letter queue
         self.lock = threading.Lock()
         self.message_timers = {}
-        self.redis_client = redis.Redis(host="localhost", port=6379, db=0)
+        self.redis_client = redis_client or Redis(
+            host="localhost", port=6379, db=0, decode_responses=True
+        )
 
     def enqueue(self, message_body):
         """
-        Simulate enqueuing messages into the queue adhering to FIFO order.
+        Simulate enqueuing messages into the queue adhering to FIFO order to the Redis backend.
         """
         with self.lock:
-            message = Message(body=message_body)
+            message_id = str(uuid4())
+            message = Message(id=message_id, body=message_body)
             # self.messages.append(message)
-
+            encoded_message = json.dumps(message.__dict__, cls=CustomJSONEncoder)
             # Start a transaction (pipeline) to ensure atomic operations
             pipeline = self.redis_client.pipeline()
-            pipeline.rpush(
-                self.name, json.dumps(message.__dict__, cls=CustomJSONEncoder)
-            )
+            pipeline.rpush(self.name, encoded_message)
             pipeline.execute()  # Executes all commands in the pipeline atomically
 
         return message.id
@@ -144,8 +144,31 @@ class OpenQ:
             # Track the timer by message ID
             self.message_timers[message.id] = timer
             timer.start()
-
+            # message = Message.from_json(message_data)
+            message.mark_received()
             return message
+
+    def acknowledge(self, message_id):
+        """
+        Removes a message from the processing list after it has been processed.
+        """
+        processing_queue_name = f"{self.name}:processing"
+
+        # Assuming message_id is a string that uniquely identifies the message
+        if not isinstance(message_id, str):
+            raise ValueError("message_id must be a string")
+
+        # Directly use the message_id to perform the removal from Redis
+        # 0 means remove all occurrences of the value
+        num_removed = self.redis_client.lrem(processing_queue_name, 0, message_id)
+
+        # Logging the result
+        if num_removed > 0:
+            logging.info(f"Message with id {message_id} acknowledged and removed.")
+        else:
+            logging.warning(
+                f"No message with id {message_id} found in the processing queue."
+            )
 
     def delete(self, message_id):
         with self.lock:
@@ -166,6 +189,30 @@ class OpenQ:
                 )
                 raise MessageNotFoundError(f"Message ID {message_id} not found")
             self._cancel_timer(message_id)
+
+    def purge_queue(self):
+        """
+        Removes all messages from the queue.
+        """
+        with self.lock:
+            try:
+                # Start a transaction (pipeline) to ensure atomic operations
+                pipeline = self.redis_client.pipeline()
+
+                # Remove all messages from the main queue and processing queue
+                pipeline.delete(self.name)
+                pipeline.delete(f"{self.name}:processing")
+
+                # Cancel all visibility timeout timers to clean up resources
+                for message_id in list(self.message_timers.keys()):
+                    self._cancel_timer(message_id)
+
+                # Execute the transaction
+                pipeline.execute()
+
+                logging.info(f"Queue {self.name} has been purged successfully.")
+            except Exception as e:
+                logging.error(f"Failed to purge queue {self.name}: {e}")
 
     @classmethod
     def create_and_send(cls, queue_name, message_body, visibility_timeout=300):
@@ -380,9 +427,13 @@ class OpenQ:
             # or re-queue it by pushing to the main queue
             if self.dlq:
                 # self.dlq.enqueue(message.body)
-                pipeline.lpush(self.dlq.name, json.dumps(message.__dict__))
+                pipeline.lpush(
+                    self.dlq.name, json.dumps(message.__dict__, cls=CustomJSONEncoder)
+                )
             else:
-                pipeline.lpush(self.name, json.dumps(message.__dict__))
+                pipeline.lpush(
+                    self.name, json.dumps(message.__dict__, cls=CustomJSONEncoder)
+                )
 
             pipeline.execute()
 
@@ -451,7 +502,7 @@ class OpenQ:
             # Decode and deserialize the messages
             decoded_messages = []
             for m in messages:
-                message_dict = json.loads(m.decode("utf-8"))
+                message_dict = json.loads(m)
                 message = Message(**message_dict)
                 decoded_messages.append(message)
         return [m.__dict__ for m in decoded_messages]
@@ -589,6 +640,11 @@ class Consumer(threading.Thread):
             time.sleep(self.processing_time)
             # Delete the message from the queue after processing
             # self.queue.delete(message.id)
+            # Acknowledge and delete the message from the queue after processing
+            self.queue.acknowledge(message.id)
+            logging.info(
+                f"✅ Successfully processed and acknowledged Task ID: {message.id}"
+            )
         except Exception as e:
             logging.exception(f"Failed to process or delete task: {str(e)}")
 
