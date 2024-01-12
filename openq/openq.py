@@ -523,7 +523,7 @@ class Producer(threading.Thread):
         sleep_time (float): Seconds to sleep after producing each task.
     """
 
-    def __init__(self, queue, num_tasks, sleep_time=1.0):
+    def __init__(self, queue, num_tasks, sleep_time=1.0, max_retries=3):
         """
         Initialize the Producer instance with a queue, number of tasks, and sleep interval.
 
@@ -531,6 +531,7 @@ class Producer(threading.Thread):
             queue (Queue): The queue instance where tasks will be added.
             num_tasks (int): The total number of tasks to be produced.
             sleep_time (float): Time in seconds to wait between task productions.
+            max_retries (int): Max number of retries on messaging falure.
         """
         super().__init__(
             daemon=True
@@ -538,6 +539,7 @@ class Producer(threading.Thread):
         self.queue = queue
         self.num_tasks = max(0, num_tasks)
         self.sleep_time = max(0, sleep_time)
+        self.max_retries = max_retries
 
     def run(self):
         """
@@ -545,17 +547,31 @@ class Producer(threading.Thread):
         """
         for i in range(self.num_tasks):
             message_body = f"Hello Task {i}"
-            message_id = self._produce_message(message_body)
-            if message_id:
-                logging.info(
-                    f"📩 Produced to Queue: '{self.queue.name}' - Task ID: {message_id}"
+            retry_count = 0
+            while retry_count <= self.max_retries:
+                message_id = self._produce_message(message_body)
+                if message_id:
+                    logging.info(
+                        f"📩 Produced Task ID: {message_id} to Queue: {self.queue.name}"
+                    )
+                    break
+                else:
+                    retry_count += 1
+                    logging.warning(
+                        f"Retry {retry_count}/{self.max_retries} for producing Task {i}"
+                    )
+                    time.sleep(
+                        min(2**retry_count, 30)
+                    )  # Exponential backoff capped at 30 seconds
+
+            if retry_count > self.max_retries:
+                logging.error(
+                    f"😩 Failed to produce Task {i} to Queue '{self.queue.name}'"
                 )
-            else:
-                logging.info(f"Failed to produce Task {i} to Queue '{self.queue.name}'")
 
             # Sleep only if there are more tasks to produce to avoid unnecessary delay after the last task.
-            should_sleep = i < self.num_tasks - 1
-            self._sleep_if_necessary(should_sleep)
+            if i < self.num_tasks - 1:
+                time.sleep(self.sleep_time)
 
     def _produce_message(self, message_body):
         try:
@@ -563,10 +579,6 @@ class Producer(threading.Thread):
         except Exception as e:
             logging.exception(f"📮 An error occurred while enqueueing: {e}")
             return None
-
-    def _sleep_if_necessary(self, should_sleep):
-        if should_sleep:
-            time.sleep(self.sleep_time)
 
 
 class Consumer(threading.Thread):
