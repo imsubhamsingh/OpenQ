@@ -12,7 +12,7 @@ from json import JSONEncoder
 from json.decoder import JSONDecodeError
 from uuid import UUID
 from uuid import uuid4
-from openq.exceptions import MessageNotFoundError
+from openq.exceptions import MessageNotFoundError, OpenQException
 
 DEBUG = True
 
@@ -252,7 +252,7 @@ class OpenQ:
 
             return cls._enqueue_to_queue(redis_client, queue_name, message_body)
         except Exception as e:
-            raise Exception(
+            raise OpenQException(
                 f"Failed to create queue '{queue_name}' or send message: {e}"
             )
 
@@ -318,7 +318,7 @@ class OpenQ:
             else:
                 raise RuntimeError(f"Queue '{queue_name}' already exists.")
         except Exception as e:
-            raise Exception(f"Failed to create queue '{queue_name}': {e}")
+            raise OpenQException(f"Failed to create queue '{queue_name}': {e}")
 
     @classmethod
     def delete_queue(cls, queue_name, redis_client=None):
@@ -340,7 +340,7 @@ class OpenQ:
             else:
                 raise RuntimeError(f"Queue '{queue_name}' does not exist.")
         except Exception as e:
-            raise Exception(f"Failed to delete queue '{queue_name}': {e}")
+            raise OpenQException(f"Failed to delete queue '{queue_name}': {e}")
 
     @classmethod
     def list_queues(cls, redis_client=None):
@@ -396,7 +396,7 @@ class OpenQ:
             for queue_name in queues:
                 redis_client.delete(queue_name)
         except Exception as e:
-            raise Exception(
+            raise OpenQException(
                 f"Failed to delete queues matching pattern '{pattern}': {e}"
             )
 
