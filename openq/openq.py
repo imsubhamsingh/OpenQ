@@ -3,15 +3,39 @@ import json
 import time
 import redis
 import logging
+import subprocess
 import datetime
 import threading
 from collections import deque
 from redis import Redis
+from json import JSONEncoder
 from json.decoder import JSONDecodeError
+from uuid import UUID
 from uuid import uuid4
-from utils import CustomJSONEncoder, is_redis_running
+from openq.exceptions import MessageNotFoundError
 
 DEBUG = True
+
+
+def is_redis_running():
+    try:
+        output = subprocess.check_output(["redis-cli", "ping"])
+        return output.strip() == b"PONG"
+    except Exception as e:
+        logging.warning(f"❌ Checking Redis server failed: {e}")
+        return False
+
+
+class CustomJSONEncoder(JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime.datetime):
+            # Format the date to a string that JSON can serialize
+            return obj.isoformat()
+
+        if isinstance(obj, UUID):
+            return str(obj)
+
+        return JSONEncoder.default(self, obj)
 
 
 class Message:
@@ -65,16 +89,6 @@ class Message:
 
     def __repr__(self):
         return f"<Message id={self.id}>"
-
-
-class VisibilityTimeOutExpired(Exception):
-    """Raised when the visibility timeout for a message has expired."""
-
-    pass
-
-
-class MessageNotFoundError(Exception):
-    pass
 
 
 class OpenQ:
@@ -511,6 +525,7 @@ class OpenQ:
         return [m.__dict__ for m in decoded_messages]
 
 
+# TODO: REMOVE Producer and Consumer class from this file
 class Producer(threading.Thread):
     """
     The Producer class is responsible for producing tasks and adding them
