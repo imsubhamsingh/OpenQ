@@ -1,4 +1,4 @@
-# OpenQ - In-Memory Messaging Queue Service
+# OpenQ - Open source Messaging Queue Service
 
 OpenQ is a sophisticated, Python-based in-memory FIFO (First-In-First-Out) message queue service that is engineered for simplicity and high performance. The application acts as a middleware that enables effective message exchange within distributed systems, ensuring reliable communication with scalability features.
 
