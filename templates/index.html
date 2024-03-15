@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenQ Dashboard</title>
+    <link rel="stylesheet" href="../static/styles.css"> <!-- Link to your stylesheet -->
+</head>
+<body>
+    <header>
+        <h1>OpenQ Dashboard</h1>
+    </header>
+
+    <nav>
+        <h2>Available Queues</h2>
+        <!-- Search Bar -->
+        <div class="search-container">
+            <input type="text" id="queue-search" onkeyup="filterQueues()" placeholder="Search Queues..." class="search-bar">
+            <ul id="search-dropdown" class="dropdown-content hide"></ul>
+        </div>
+        
+        <button onclick="fetchQueues()">Search</button>
+        <ul id="queue-list" class="queue-list">
+            <!-- Queue items will be listed here -->
+        </ul>
+    </nav>
+    
+    
+
+    <main>
+        <!-- Create Queue Section -->
+        <section class="form-section">
+            <h2>Create Queue</h2>
+            <input type="text" id="queue-name" placeholder="Enter Queue Name" class="input-field">
+            <button onclick="createQueue()" class="action-button">Create Queue</button>
+            <div class="operation-result">
+                <pre class="result-content"></pre>
+            </div>
+        </section>
+
+        <!-- Enqueue Message Section -->
+        <section class="form-section">
+            <h2>Enqueue Message</h2>
+            <input type="text" id="enqueue-queue-name" placeholder="Enter Queue Name" class="input-field">
+            <textarea id="message-body" placeholder="Enter Message" class="textarea-field"></textarea>
+            <button onclick="enqueueMessage()" class="action-button">Enqueue Message</button>
+            <div class="operation-result">
+                <pre class="result-content"></pre>
+            </div>
+        </section>
+
+        <!-- Dequeue Message Section -->
+        <section class="form-section">
+            <h2>Dequeue Message</h2>
+            <input type="text" id="dequeue-queue-name" placeholder="Enter Queue Name" class="input-field">
+            <button onclick="dequeueMessage()" class="action-button">Dequeue Message</button>
+            <div class="operation-result">
+                <pre class="result-content"></pre>
+            </div>
+        </section>
+
+        <!-- Get Queue Attributes Section -->
+        <section class="form-section">
+            <h2>Get Queue Attributes</h2>
+            <input type="text" id="attributes-queue-name" placeholder="Enter Queue Name" class="input-field">
+            <button onclick="getQueueAttributes()" class="action-button">Get Attributes</button>
+            <div class="operation-result">
+                <pre class="result-content"></pre>
+            </div>
+        </section>
+    </main>
+
+    <script src="../static/dashboard.js"></script>
+</body>
+</html>

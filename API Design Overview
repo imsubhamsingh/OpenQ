@@ -1,0 +1,60 @@
+API Design Overview
+    Create Queue
+
+        Endpoint: POST /create-queue
+        Payload: { "queueName": "string" }
+        Response: Success or error message.
+
+    Enqueue Message
+
+        Endpoint: POST /enqueue-message
+        Payload: { "queueName": "string", "messageBody": "string" }
+        Response: Message ID or error message.
+    
+    Dequeue Message
+
+        Endpoint: POST /dequeue-message
+        Payload: { "queueName": "string" }
+        Response: Message body and ID, or error message.
+    
+    Delete Message
+
+        Endpoint: DELETE /delete-message
+        Payload: { "queueName": "string", "messageId": "string" }
+        Response: Success or error message.
+    
+    Get Queue Attributes
+
+        Endpoint: GET /queue-attributes
+        Query Parameters: queueName=string
+        Response: Queue attributes, including the number of messages available and in-flight.
+
+
+
+
+Example Usage:
+Once your server is running, you can use curl or any API client like Postman to interact with it. Here are some curl commands as examples:
+
+Create Queue:
+    curl --request POST \
+    --url http://127.0.0.1:5000/create-queue \
+    --header 'Content-Type: application/json' \
+    --data '{"queueName": "my_queue"}'
+
+Enqueue Message:
+    curl --request POST \
+    --url http://127.0.0.1:5000/enqueue-message \
+    --header 'Content-Type: application/json' \
+    --data '{"queueName": "my_queue", "messageBody": "Hello, World!"}'
+
+
+Dequeue Message:
+    curl --request POST \
+    --url http://127.0.0.1:5000/dequeue-message \
+    --header 'Content-Type: application/json' \
+    --data '{"queueName": "my_queue"}'
+
+
+Get Queue Attributes:
+    curl --request GET \
+    --url 'http://127.0.0.1:5000/queue-attributes?queueName=my_queue'
